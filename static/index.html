@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Taste — AI photo culling that learns your eye</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <h1>Taste</h1>
+  <p class="tagline">AI photo culling that learns <em>your</em> eye.</p>
+  <div id="vision-banner" class="banner pending" hidden>
+    Vision pass pending API key — composition / moment scores are neutral placeholders, not model output.
+    Set <code>META_MODEL_API_KEY</code> to enable Muse Spark vision + SAM 3.1 subject scores.
+  </div>
+  <div id="state" class="state">Loading…</div>
+  <div class="controls">
+    <button id="btn-demo">Load demo set (152 Nepal frames)</button>
+    <label class="upload-label">Upload shoot
+      <input type="file" id="file-input" accept="image/*" multiple hidden>
+    </label>
+    <button id="btn-groups">Near-duplicate groups</button>
+    <button id="btn-export">Export keep-set + contact sheet</button>
+  </div>
+  <div id="dropzone" class="dropzone">Drop a batch of photos here</div>
+  <p class="keys">Keys: <b>←</b>/<b>→</b> navigate &nbsp; <b>J</b> reject &nbsp; <b>K</b> clear &nbsp; <b>L</b> keep &nbsp; Click a card to select. Click a <span class="dup-badge">dup</span> badge to compare the group.</p>
+  <div id="export-result" class="export-result" hidden></div>
+</header>
+
+<main>
+  <section id="detail" class="detail" hidden></section>
+  <section id="groups-view" class="groups-view" hidden></section>
+  <section id="grid" class="grid"></section>
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

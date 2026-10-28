@@ -1,0 +1,7 @@
+fastapi>=0.110
+uvicorn>=0.29
+pillow>=10
+numpy>=1.26
+scikit-learn>=1.4
+opencv-python-headless>=4.9
+python-multipart>=0.0.9
