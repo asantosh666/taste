@@ -22,13 +22,20 @@
     </label>
     <button id="btn-groups">Near-duplicate groups</button>
     <button id="btn-export">Export keep-set + contact sheet</button>
+    <label class="keepset-label">Keep-set size
+      <input type="number" id="keep-n" value="20" min="1" max="152">
+    </label>
+    <button id="btn-keepset">Build coverage-aware keep-set</button>
+    <button id="btn-eval">Evaluation</button>
   </div>
   <div id="dropzone" class="dropzone">Drop a batch of photos here</div>
-  <p class="keys">Keys: <b>←</b>/<b>→</b> navigate &nbsp; <b>J</b> reject &nbsp; <b>K</b> clear &nbsp; <b>L</b> keep &nbsp; Click a card to select. Click a <span class="dup-badge">dup</span> badge to compare the group.</p>
+  <p class="keys">Keys: <b>←</b>/<b>→</b> navigate &nbsp; <b>P</b>/<b>L</b> keep &nbsp; <b>X</b>/<b>J</b> reject &nbsp; <b>U</b>/<b>K</b> clear &nbsp; <b>M</b> maybe &nbsp; <b>Z</b> 100% zoom &nbsp; Keyboard flagging auto-advances. Click a card to select. Click a <span class="dup-badge">dup</span> badge to compare the group.</p>
   <div id="export-result" class="export-result" hidden></div>
+  <div id="keepset-result" class="export-result" hidden></div>
 </header>
 
 <main>
+  <section id="eval" class="eval"><div id="eval-result" class="export-result" hidden></div></section>
   <section id="detail" class="detail" hidden></section>
   <section id="groups-view" class="groups-view" hidden></section>
   <section id="grid" class="grid"></section>

@@ -5,8 +5,11 @@ Feature vector (in order):
   1. exposure_quality, standardized
   2. composition (Muse Spark vision score; NEUTRAL 0.5 while pending)
   3. moment (Muse Spark vision score; NEUTRAL 0.5 while pending)
+  4. subject_sharpness (SAM 3.1 mask-restricted sharpness ratio; NEUTRAL
+     0.5 while pending, and also 0.5 when SAM completed with no subject
+     found — "no subject" carries no sharpness signal either way)
 
-While vision is pending, features 2-3 are constant, so they carry ~zero
+While vision is pending, features 2-4 are constant, so they carry ~zero
 weight after standardization — the model honestly learns only from real
 signals (sharpness/exposure) until the vision pass goes live.
 
@@ -22,18 +25,26 @@ from sklearn.preprocessing import StandardScaler
 
 from vision import NEUTRAL_VISION_SCORE
 
-FEATURE_NAMES = ["sharpness_log", "exposure_quality", "composition", "moment"]
+FEATURE_NAMES = [
+    "sharpness_log",
+    "exposure_quality",
+    "composition",
+    "moment",
+    "subject_sharpness",
+]
 
 
 def feature_vector(feat: dict, vision: dict) -> np.ndarray:
     comp = vision.get("composition")
     mom = vision.get("moment")
+    subj = vision.get("subject_sharpness")
     return np.array(
         [
             feat["sharpness_log"],
             feat["exposure_quality"],
             NEUTRAL_VISION_SCORE if comp is None else comp,
             NEUTRAL_VISION_SCORE if mom is None else mom,
+            NEUTRAL_VISION_SCORE if subj is None else subj,
         ],
         dtype=float,
     )

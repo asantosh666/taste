@@ -1,6 +1,6 @@
-# Taste — MVP scaffold (D1)
+# Taste
 
-AI photo-culling assistant that learns the photographer's eye.
+AI photo-culling assistant that shows its work.
 FastAPI backend + vanilla HTML/JS UI. Meta Global AI Developer Hackathon,
 indie track. Build window Oct 26 – Nov 4, 2026; submission due Nov 4, 6 PM PT.
 
@@ -32,39 +32,61 @@ python3 -m venv .venv
 - **Taste model** (`taste_model.py`): logistic regression over
   [sharpness_log, exposure_quality, composition, moment], seeded with the
   50 calibration labels. Every keep/reject refits and re-ranks.
-- **Keys**: `←`/`→` navigate, `J` reject, `K` clear, `L` keep.
+- **Keys**: `←`/`→` navigate, `P`/`L` keep, `X`/`J` reject, `U`/`K` clear,
+  `M` maybe, `Z` 100% zoom. Keyboard flagging auto-advances.
 - **Compare**: `dup` badges and the groups view show near-duplicates
-  side by side with per-frame keep/reject.
+  side by side with per-frame keep/reject, synced pan, and a delta table.
+- **Subject strip**: SAM 3.1 subject crops, shown in the detail view and
+  as a small badge on grid cards (subject sharpness is visible info; it
+  did not lift the ranking).
+- **Keep-set**: coverage-aware — "give me 20" returns one winner per
+  duplicate group first, then fills by rank.
+- **Reason cards + Maybe bucket**: deterministic reason cards per frame;
+  Maybe excludes a frame from training (clearing restores it).
+- **Evaluation** (`/api/evaluate`): in-sample vs held-out results shown
+  explicitly, with the honesty note that the model does not generalize
+  beyond the calibration labels.
 - **Export**: copies the keep-set (user keeps, else top 20 by rank) to
   `data/exports/<timestamp>/` plus a `contact_sheet.jpg` montage.
 
-## Vision pass — pending API key (read this)
+## Vision pass — live (updated 2026-10-28)
 
-`vision.py` defines the interface for two later calls: Muse Spark
-multimodal vision (composition + moment) and SAM 3.1 subject masks
-(sharpness-by-subject). Today it is **pending, not stubbed with fake
-scores**:
-
-- No `META_MODEL_API_KEY` in the environment → all vision scores are
-  `None`, status `pending_api_key`, and the UI shows a banner:
-  "vision pass pending API key". Ranking substitutes neutral 0.5 for
-  composition/moment *inside the model only*; the UI labels them pending.
-- Scores are cached on disk under `.cache/vision/<sha256>.json`, so a
-  frame is scored at most once (budget guardrail for the $150 credits).
-- When the key arrives, set `META_MODEL_API_KEY` (and
-  `META_MODEL_API_URL` for the endpoint) — see `.env.example`. Never
-  put a real key in code or git; `.env` is gitignored.
+`vision.py` scores frames with Muse Spark multimodal vision
+(composition + moment) via the Meta Model API, and SAM 3.1 subject
+masks (sharpness-by-subject). The $150 hackathon credits funded the
+live passes; scores are cached on disk under `.cache/vision/<sha256>.json`,
+so a frame is scored at most once. Never put a real key in code or git;
+`.env` is gitignored (see `.env.example` for the placeholder).
 
 ## Layout
 
 - `main.py` — FastAPI app + API (`/api/state`, `/api/rank`, `/api/label`,
-  `/api/groups`, `/api/upload`, `/api/export`, `/api/thumb|image/{id}`)
-- `features.py`, `vision.py`, `taste_model.py` — pipeline layers
+  `/api/groups`, `/api/upload`, `/api/export`, `/api/thumb|image/{id}`,
+  `/api/evaluate`, `/api/keep-set`, `/api/subject-crop/{id}`)
+- `features.py`, `vision.py`, `taste_model.py`, `pairwise.py`,
+  `pairwise_learn.py` — pipeline layers
 - `static/` — `index.html`, `app.js`, `style.css`
 - `data/` — uploads, `labels.json` (persisted user labels by file hash),
   exports (gitignored)
 - `.cache/` — feature cache (`features.json`), thumbnails, vision cache
   (gitignored)
+
+## Verified 2026-10-28 (final demo state)
+
+Live vision pass complete: calibration keepers vs rejects separate by
++0.072 (keepers 0.536 vs rejects 0.464), with 6 keepers in the top 25 and
+10 in the top 50 — a real but modest separation. Held-out accuracy is
+about chance (~0.46–0.50), and a fresh-photo test of the
+lowest-luminance-contrast rule failed (3/11 vs ~3.45 chance), so the demo
+claims UX + honesty, not generalization. Three further ranking levers
+were tried and did not move the ranking: SAM subject sharpness (no lift),
+pairwise within-group re-rank (worse, reverted), and pairwise learning
+from keep/reject overrides (0.500 held-out vs 0.502 current model,
+experimental only, does not drive ranking). Bug-hunt fixes verified
+live: same-name uploads no longer overwrite, non-image uploads are
+rejected cleanly, the export traversal hole returns 404, and the
+sticky-header scroll fix is intact. Labels, weights, top-25/top-50 and
+35/35 pairwise coverage unchanged through the fixes.
 
 ## Verified 2026-10-26 (D1)
 
