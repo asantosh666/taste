@@ -6,3 +6,4 @@ scikit-learn>=1.4
 opencv-python-headless>=4.9
 python-multipart>=0.0.9
 meta-sam-parser==0.1.0
+mediapipe==1.2.3

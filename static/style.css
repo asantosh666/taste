@@ -9,6 +9,10 @@ h1 { margin: 0; font-size: 28px; letter-spacing: 0.5px; }
 .controls { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0; }
 button, .upload-label { background: #2a2a2a; color: #eee; border: 1px solid #555; border-radius: 6px; padding: 8px 14px; cursor: pointer; font-size: 14px; }
 button:hover, .upload-label:hover { background: #3a3a3a; }
+button:disabled { opacity: 0.45; cursor: default; }
+button:disabled:hover { background: #2a2a2a; }
+#separate-result ul { margin: 4px 0 8px; padding-left: 20px; font-size: 13px; }
+#separate-result code { overflow-wrap: anywhere; }
 .dropzone { border: 2px dashed #555; border-radius: 8px; padding: 18px; text-align: center; color: #999; margin: 10px 0; }
 .dropzone.over { border-color: #7ab8ff; color: #cfe6ff; background: #1a2733; }
 .keys { font-size: 13px; color: #999; }
@@ -31,6 +35,10 @@ main { padding: 16px 20px; }
 .label-badge.calib { background: #444; color: #ddd; }
 .label-badge.winner { background: #b8860b; color: #fff; }
 .label-badge.maybe { background: #5b5bd6; color: #fff; }
+.label-badge.people { background: #2a5a7a; color: #fff; }
+.label-badge.nopeople { background: #444; color: #ddd; }
+.filter-btn.active { background: #2a5a7a; border-color: #5a9ac2; color: #fff; }
+.people-label { align-self: center; font-size: 14px; color: #bbb; }
 .card.maybe { border-color: #5b5bd6; }
 .badge-contested { display: inline-block; background: #8a2f2b; color: #fff; border-radius: 4px; padding: 1px 6px; font-size: 11px; margin-left: 4px; }
 .detail.zoomed { overflow-x: auto; }
@@ -61,6 +69,14 @@ main { padding: 16px 20px; }
   .detail img { max-width: 100%; }
 }
 .groups-view { margin-bottom: 16px; }
+.source-controls input, .best-controls select { background: #1c1c1c; color: #eee; border: 1px solid #555; border-radius: 6px; padding: 6px 8px; font-size: 14px; }
+button.danger { border-color: #8a2f2b; color: #ffb3b0; }
+button.danger:hover { background: #3a1d1c; }
+.best-list { display: flex; flex-direction: column; gap: 8px; margin: 8px 0; }
+.best-pick { display: flex; gap: 10px; align-items: center; background: #1c1c1c; border: 1px solid #444; border-radius: 6px; padding: 6px; font-size: 13px; }
+.best-pick img { width: 120px; height: 80px; object-fit: cover; border-radius: 4px; }
+.best-pick.excluded { opacity: 0.45; }
+.del-confirm { font-size: 13px; color: #ffb3b0; }
 .group { background: #1c1c1c; border: 1px solid #444; border-radius: 8px; padding: 12px; margin-bottom: 12px; }
 .group h3 { margin: 0 0 8px; font-size: 15px; }
 .compare { display: flex; gap: 12px; flex-wrap: wrap; }

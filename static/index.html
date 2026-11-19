@@ -28,6 +28,37 @@
     <button id="btn-keepset">Build coverage-aware keep-set</button>
     <button id="btn-eval">Evaluation</button>
   </div>
+  <div class="controls people-controls">
+    <span class="people-label">People:</span>
+    <button id="btn-people-all" class="filter-btn active">All</button>
+    <button id="btn-people-with" class="filter-btn">With people</button>
+    <button id="btn-people-without" class="filter-btn">Without people</button>
+    <button id="btn-people-run">Detect people (offline)</button>
+    <button id="btn-people-separate" disabled>Separate into folders</button>
+    <span id="people-status" class="hint"></span>
+  </div>
+  <div id="separate-result" class="export-result" hidden></div>
+  <div class="controls best-controls">
+    <span class="people-label">Best shots:</span>
+    <label class="keepset-label">Top
+      <select id="best-n">
+        <option value="10" selected>10</option>
+        <option value="25">25</option>
+        <option value="50">50</option>
+        <option value="100">100</option>
+      </select>
+    </label>
+    <button id="btn-best-preview">Preview best shots</button>
+    <span id="best-status" class="hint"></span>
+  </div>
+  <div id="best-result" class="export-result" hidden></div>
+  <div class="controls source-controls">
+    <span class="people-label">Folder:</span>
+    <span id="source-current" class="hint"></span>
+    <input id="source-input" type="text" size="42" placeholder="/path/to/working-set (must have manifest.csv)">
+    <button id="btn-source-set">Switch folder</button>
+    <span id="source-status" class="hint"></span>
+  </div>
   <div id="dropzone" class="dropzone">Drop a batch of photos here</div>
   <p class="keys">Keys: <b>←</b>/<b>→</b> navigate &nbsp; <b>P</b>/<b>L</b> keep &nbsp; <b>X</b>/<b>J</b> reject &nbsp; <b>U</b>/<b>K</b> clear &nbsp; <b>M</b> maybe &nbsp; <b>Z</b> 100% zoom &nbsp; Keyboard flagging auto-advances. Click a card to select. Click a <span class="dup-badge">dup</span> badge to compare the group.</p>
   <div id="export-result" class="export-result" hidden></div>

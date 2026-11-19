@@ -4,13 +4,24 @@ let groupsVisible = false;
 let groupsData = [];
 let q1Sharp = 0;
 let q3Sharp = 0;
+// People-split state: flags keyed by item id, filter, last job status.
+let peopleById = {};
+let peopleFilter = "all";
+let lastPeople = null;
+let peoplePoll = null;
 
 const $ = (id) => document.getElementById(id);
 
 async function api(path, opts) {
   const r = await fetch(path, opts);
-  if (!r.ok) throw new Error(`${path} -> ${r.status}`);
-  return r.json();
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    const err = new Error(body.error || `${path} -> ${r.status}`);
+    err.status = r.status;
+    err.body = body;
+    throw err;
+  }
+  return body;
 }
 
 function visionLabel(v) {
@@ -75,11 +86,42 @@ function groupMembers(it) {
   return groupsData[it.group] || null;
 }
 
+// People filter: the grid/detail/keyboard all work on this visible list,
+// so "With people" shows exactly the flagged frames and nothing else.
+function visibleItems() {
+  if (peopleFilter === "with") return items.filter((it) => peopleById[it.id] && peopleById[it.id].has_person === true);
+  if (peopleFilter === "without") return items.filter((it) => peopleById[it.id] && peopleById[it.id].has_person === false);
+  return items;
+}
+
+function updatePeopleBar(p) {
+  if (!p) return;
+  const all = $("btn-people-all"), w = $("btn-people-with"), wo = $("btn-people-without");
+  all.textContent = `All (${p.total})`;
+  w.textContent = `With people (${p.with_people})`;
+  wo.textContent = `Without people (${p.without_people})`;
+  [all, w, wo].forEach((b) => b.classList.remove("active"));
+  ({ all, with: w, without: wo })[peopleFilter].classList.add("active");
+  const st = $("people-status");
+  if (p.status === "running") st.textContent = `Detecting people… ${p.done}/${p.total} (offline, ~0.6s/photo)`;
+  else if (p.status === "done") st.textContent = `People detection done — ${p.with_people} with people, ${p.without_people} without${p.seconds ? ` in ${p.seconds}s` : " (cached)"}`;
+  else if (p.status === "unavailable") st.textContent = "People detection unavailable — " + (p.note || "mediapipe/model missing");
+  else st.textContent = p.done > 0 ? `${p.done}/${p.total} detected — run detection to finish` : "People not detected yet — run detection (offline, ~0.6s/photo)";
+  // Separate into folders needs a complete detection pass first.
+  const sep = $("btn-people-separate");
+  if (sep) sep.disabled = p.status !== "done";
+}
+
 async function refresh(keepSelectionId) {
-  const [st, rank, grp] = await Promise.all([api("/api/state"), api("/api/rank"), api("/api/groups")]);
+  const [st, rank, grp, ppl, src] = await Promise.all([api("/api/state"), api("/api/rank"), api("/api/groups"), api("/api/people"), api("/api/source")]);
   items = rank.items;
   groupsData = grp.groups;
   computeQuartiles();
+  peopleById = {};
+  (ppl.items || []).forEach((p) => { peopleById[p.id] = p; });
+  lastPeople = ppl;
+  updatePeopleBar(ppl);
+  $("source-current").textContent = `${src.demo_dir} · ${src.visible}/${src.total} frames${src.persisted ? "" : " (built-in set)"}`;
   const banner = $("vision-banner");
   banner.className = "banner " + (st.vision_status === "live" ? "live" : "pending");
   banner.hidden = false;
@@ -97,10 +139,11 @@ async function refresh(keepSelectionId) {
     `${st.dupe_groups} near-duplicate groups (${st.dupe_frames} frames) · vision: ${st.vision_status}`;
   renderGrid();
   if (keepSelectionId) {
-    const i = items.findIndex((x) => x.id === keepSelectionId);
+    const vis = visibleItems();
+    const i = vis.findIndex((x) => x.id === keepSelectionId);
     if (i >= 0) selected = i;
   }
-  selected = Math.max(0, Math.min(selected, items.length - 1));
+  selected = Math.max(0, Math.min(selected, Math.max(0, visibleItems().length - 1)));
   renderDetail();
   if (!$("eval-result").hidden) renderEval();
 }
@@ -108,13 +151,17 @@ async function refresh(keepSelectionId) {
 function renderGrid() {
   const grid = $("grid");
   grid.innerHTML = "";
-  items.forEach((it, i) => {
+  const vis = visibleItems();
+  vis.forEach((it, i) => {
     const card = document.createElement("div");
     card.className = "card" + (i === selected ? " selected" : "") + (it.user_label ? " " + it.user_label : "");
+    const pb = peopleById[it.id];
     card.innerHTML =
       `<img src="/api/thumb/${it.id}" alt="" loading="lazy">` +
       `<div class="meta"><span class="score">${it.score.toFixed(2)}</span> ${it.filename}` +
       (it.group !== null && it.group !== undefined ? `<span class="dup-badge" title="Near-duplicate group">dup ${it.group + 1}</span>` : "") +
+      (pb && pb.has_person === true ? `<span class="label-badge people" title="Offline tiled EfficientDet-Lite0, conf 0.3">👤 people${pb.person_count ? " ×" + pb.person_count : ""}</span>` : "") +
+      (pb && pb.has_person === false ? `<span class="label-badge nopeople" title="Offline tiled EfficientDet-Lite0, conf 0.3">no people</span>` : "") +
       (it.pairwise && it.pairwise.is_winner ? `<span class="label-badge winner">★ group winner</span>` : "") +
       (it.user_label ? `<span class="label-badge ${it.user_label}">${it.user_label}</span>` : "") +
       (it.calib_label ? `<span class="label-badge calib">calib ${it.calib_label}</span>` : "") +
@@ -135,7 +182,7 @@ function renderGrid() {
 
 function renderDetail() {
   const d = $("detail");
-  const it = items[selected];
+  const it = visibleItems()[selected];
   if (!it) { d.hidden = true; return; }
   d.hidden = false;
   d.innerHTML =
@@ -159,6 +206,15 @@ function renderDetail() {
     `<span style="color:#999">${it.vision.note}</span><br>` +
     `Set: ${it.set} · calibration: ${it.calib_label || "—"} · your label: ${it.user_label || "—"}<br>` +
     (() => {
+      const pb = peopleById[it.id];
+      if (!pb || pb.has_person === null || pb.has_person === undefined) return `People: <i>not detected yet</i> — run Detect people (offline)<br>`;
+      const line = pb.has_person
+        ? `People: <b>yes</b> — ${pb.person_count} detection${pb.person_count === 1 ? "" : "s"}${pb.max_conf !== null && pb.max_conf !== undefined ? `, best confidence ${pb.max_conf}` : ""} (offline tiled EfficientDet-Lite0)`
+        : `People: <b>none detected</b> (offline tiled EfficientDet-Lite0)`;
+      const flipTo = pb.has_person ? "no people" : "people";
+      return `${line} <button onclick="flipPeople('${it.id}', ${!pb.has_person})">Flip to ${flipTo}</button><br>`;
+    })() +
+    (() => {
       const cards = reasonCards(it, groupMembers(it));
       const c = contested(it);
       return (cards.length ? `Why it stands out (measured, not praise): <span class="reasons">${cards.map((x) => `<span class="reason">${x}</span>`).join(" ")}</span><br>` : "") +
@@ -171,18 +227,28 @@ function renderDetail() {
 }
 
 async function labelSelected(label, advance) {
-  const it = items[selected];
+  const it = visibleItems()[selected];
   if (!it) return;
   await api("/api/label", { method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ id: it.id, label }) });
   await refresh(it.id); // refit + re-rank; selection follows the same frame
-  if (advance && items.length) {
+  if (advance) {
     // Keyboard flagging auto-advances to the next frame (mouse clicks
     // in buttons do not — the user is still looking at that frame).
-    const i = items.findIndex((x) => x.id === it.id);
-    selected = Math.min((i >= 0 ? i : selected) + 1, items.length - 1);
+    const vis = visibleItems();
+    const i = vis.findIndex((x) => x.id === it.id);
+    selected = Math.min((i >= 0 ? i : selected) + 1, Math.max(0, vis.length - 1));
     renderGrid(); renderDetail();
   }
+}
+
+// Flip one photo's people verdict (manual correction). The cache is
+// updated server-side, so badges, filter counts and the dry-run
+// reflect the change after this refresh.
+async function flipPeople(id, hasPerson) {
+  await api("/api/people/override", { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id, has_person: hasPerson }) });
+  await refresh(id);
 }
 
 let compareZoom = "fit";
@@ -223,6 +289,7 @@ async function showGroup(gi) {
     `<div class="zoombar">Zoom: <button onclick="setCompareZoom('fit')">Fit</button> <button onclick="setCompareZoom('100')">100%</button> <button onclick="setCompareZoom('200')">200%</button> <span class="hint">scrolling one frame scrolls all (synced pan)</span></div>` +
     `<div class="compare">` +
     grp.map((m) => `<figure><div class="sync-frame"><img src="/api/image/${m.id}" data-sync onload="applyCompareZoom()"></div><figcaption>${m.filename} · score ${m.score.toFixed(2)} · sharp ${m.sharpness}` +
+      (m.is_suggested_keeper ? ` <span class="label-badge winner">★ suggested keeper</span>` : "") +
       (m.pairwise && m.pairwise.status === "live" ? ` · pairwise #${m.pairwise.rank_in_group}/${m.pairwise.group_size}${m.pairwise.is_winner ? " ★ winner" : ""} — ${m.pairwise.deciding}` : "") +
       `<br><span class="reasons">${reasonCards(m, grp).map((c) => `<span class="reason">${c}</span>`).join(" ")}</span>` +
       `</figcaption>` +
@@ -252,8 +319,9 @@ async function labelId(id, label) {
 
 document.addEventListener("keydown", (e) => {
   if (e.target.tagName === "INPUT") return;
-  if (!items.length) return;
-  if (e.key === "ArrowRight") { selected = Math.min(selected + 1, items.length - 1); renderGrid(); renderDetail(); }
+  const vis = visibleItems();
+  if (!vis.length) return;
+  if (e.key === "ArrowRight") { selected = Math.min(selected + 1, vis.length - 1); renderGrid(); renderDetail(); }
   else if (e.key === "ArrowLeft") { selected = Math.max(selected - 1, 0); renderGrid(); renderDetail(); }
   else if (e.key === "l" || e.key === "L") labelSelected("keep", true);
   else if (e.key === "j" || e.key === "J") labelSelected("reject", true);
@@ -302,17 +370,233 @@ $("btn-keepset").onclick = async () => {
   };
 };
 
-$("btn-groups").onclick = async () => {
+function setPeopleFilter(f) {
+  peopleFilter = f;
+  selected = 0;
+  renderGrid(); renderDetail();
+  updatePeopleBar(lastPeople);
+}
+
+$("btn-people-all").onclick = () => setPeopleFilter("all");
+$("btn-people-with").onclick = () => setPeopleFilter("with");
+$("btn-people-without").onclick = () => setPeopleFilter("without");
+$("btn-people-run").onclick = async () => {
+  const res = await api("/api/people/start", { method: "POST" });
+  lastPeople = res;
+  updatePeopleBar(res);
+  if (res.status === "unavailable") return;
+  if (peoplePoll) clearInterval(peoplePoll);
+  peoplePoll = setInterval(async () => {
+    try {
+      const p = await api("/api/people");
+      lastPeople = p;
+      updatePeopleBar(p);
+      if (p.status === "done" || p.status === "unavailable") {
+        clearInterval(peoplePoll); peoplePoll = null;
+        await refresh();
+      }
+    } catch (err) { clearInterval(peoplePoll); peoplePoll = null; }
+  }, 2000);
+};
+
+function escHtml(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+// Separate into folders: dry-run first (moves nothing), confirm moves.
+$("btn-people-separate").onclick = async () => {
+  const el = $("separate-result");
+  el.hidden = false;
+  el.innerHTML = "Checking what would move…";
+  let dry;
+  try {
+    dry = await api("/api/people/separate/dry-run");
+  } catch (err) {
+    // api() throws on non-2xx without the body; re-fetch for the message.
+    let msg = err.message;
+    try {
+      const r = await fetch("/api/people/separate/dry-run");
+      const body = await r.json();
+      msg = body.error || msg;
+      if (body.no_result && body.no_result.length) {
+        el.innerHTML = `<b>People detection is not complete.</b><br>No result yet for: ${body.no_result.map(escHtml).join(", ")}<br>Run Detect people first.`;
+        return;
+      }
+    } catch (_) { /* keep err.message */ }
+    el.innerHTML = `<b>Separate into folders failed:</b> ${escHtml(msg)}`;
+    return;
+  }
+  const list = (arr) => arr.length ? `<ul>${arr.map((x) => `<li>${escHtml(x)}</li>`).join("")}</ul>` : "<i>none</i>";
+  el.innerHTML =
+    `<b>Separate into folders — dry run</b><br>` +
+    `${dry.counts.with_people} RAW file(s) with people → <code>${escHtml(dry.dest_with)}</code><br>` +
+    `${dry.counts.without_people} RAW file(s) without people → <code>${escHtml(dry.dest_without)}</code><br>` +
+    `No matching RAW (${dry.unmatched.length}): ${list(dry.unmatched)}` +
+    `No detection result (${dry.no_result.length}): ${list(dry.no_result)}` +
+    `<p class="hint">Only the RAW originals move — the previews stay where they are. A move log is written next to the moves and in the app's data folder, so every move can be undone by hand.</p>` +
+    `<button id="btn-separate-confirm">Move the RAW files</button> <button id="btn-separate-cancel">Cancel</button>`;
+  $("btn-separate-cancel").onclick = () => { el.hidden = true; el.innerHTML = ""; };
+  $("btn-separate-confirm").onclick = async () => {
+    el.innerHTML = "Moving files…";
+    try {
+      const res = await api("/api/people/separate/run", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirmed: true }) });
+      el.innerHTML =
+        `<b>Moved ${res.moved_with} RAW file(s) with people</b> → <code>${escHtml(res.dest_with)}</code><br>` +
+        `<b>Moved ${res.moved_without} RAW file(s) without people</b> → <code>${escHtml(res.dest_without)}</code><br>` +
+        `Skipped (no detection): ${res.skipped_no_result.length ? escHtml(res.skipped_no_result.join(", ")) : "none"}<br>` +
+        `Skipped (no matching RAW): ${res.skipped_unmatched.length ? escHtml(res.skipped_unmatched.join(", ")) : "none"}<br>` +
+        `Move log: <code>${escHtml(res.log)}</code> (a copy is in each destination folder too)`;
+      await refresh();
+    } catch (err) {
+      el.innerHTML = `<b>Move failed:</b> ${escHtml(err.message)} — files moved before the failure stay moved; the move log in the app's data folder lists them.`;
+    }
+  };
+};
+
+// Best shots: one best per similar group, user rejects, then move.
+// Rejected picks are excluded client-side and sent as `excluded`.
+let bestExcluded = new Set();
+let bestTopN = 10;
+
+function renderBest(dry) {
+  const el = $("best-result");
+  const kept = dry.picks.filter((p) => !bestExcluded.has(p.id));
+  el.innerHTML =
+    `<b>Best shots — one best per similar group, top ${dry.top_n} by rank</b><br>` +
+    `${kept.length} pick(s) → <code>${escHtml(dry.dest)}</code> · ${dry.skipped_dupes.length} duplicate(s) held back · ` +
+    (dry.unmatched.length ? `no RAW for: ${dry.unmatched.map(escHtml).join(", ")}` : "every pick has a matching RAW") + `<br>` +
+    `<div class="best-list">` + dry.picks.map((p) => {
+      const out = bestExcluded.has(p.id);
+      return `<div class="best-pick${out ? " excluded" : ""}"><img src="/api/thumb/${p.id}" alt="" loading="lazy">` +
+        `<div><b>${escHtml(p.filename)}</b> · score ${p.score.toFixed(3)} · sharp ${p.sharpness} · expo ${p.exposure_quality}<br>` +
+        (p.group_size > 1 ? `best of ${p.group_size} similar` : "no duplicates") +
+        ` <button data-best-reject="${p.id}">${out ? "Restore" : "Reject ✕"}</button></div></div>`;
+    }).join("") + `</div>` +
+    `<p class="hint">Rejected picks are excluded from the move. Only the RAW originals move — the previews stay where they are. A move log is written next to the moves and in the app's data folder.</p>` +
+    `<button id="btn-best-confirm">Move best shots (${kept.length})</button> <button id="btn-best-cancel">Cancel</button>`;
+  el.querySelectorAll("[data-best-reject]").forEach((b) => {
+    b.onclick = () => {
+      const id = b.getAttribute("data-best-reject");
+      if (bestExcluded.has(id)) bestExcluded.delete(id); else bestExcluded.add(id);
+      renderBest(dry);
+    };
+  });
+  $("btn-best-cancel").onclick = () => { el.hidden = true; el.innerHTML = ""; };
+  $("btn-best-confirm").onclick = async () => {
+    el.innerHTML = "Moving files…";
+    try {
+      const res = await api("/api/best/separate/run", { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ confirmed: true, top_n: bestTopN, excluded: [...bestExcluded] }) });
+      el.innerHTML =
+        `<b>Moved ${res.moved} best-shot RAW file(s)</b> → <code>${escHtml(res.dest)}</code><br>` +
+        `Excluded by you: ${res.excluded.length} · Skipped (no matching RAW): ${res.skipped_unmatched.length ? escHtml(res.skipped_unmatched.join(", ")) : "none"}<br>` +
+        `Move log: <code>${escHtml(res.log)}</code> (a copy is in the destination folder too)`;
+      await refresh();
+    } catch (err) {
+      el.innerHTML = `<b>Move failed:</b> ${escHtml(err.message)}`;
+    }
+  };
+}
+
+$("btn-best-preview").onclick = async () => {
+  bestTopN = parseInt($("best-n").value, 10) || 10;
+  bestExcluded = new Set();
+  const el = $("best-result");
+  el.hidden = false;
+  el.innerHTML = "Ranking best shots…";
+  try {
+    const dry = await api(`/api/best/dry-run?top_n=${bestTopN}`);
+    renderBest(dry);
+  } catch (err) {
+    el.innerHTML = `<b>Best shots failed:</b> ${escHtml(err.message)}`;
+  }
+};
+
+// Feed any folder: switch to an already-ingested working set
+// (tools/ingest.py). No restart; the choice persists.
+$("btn-source-set").onclick = async () => {
+  const dir = $("source-input").value.trim();
+  const st = $("source-status");
+  if (!dir) { st.textContent = "Type a folder path first."; return; }
+  st.textContent = "Switching…";
+  try {
+    const res = await api("/api/source/set", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ demo_dir: dir }) });
+    st.textContent = `Switched to ${res.set_name}`;
+    selected = 0;
+    await refresh();
+  } catch (err) {
+    st.textContent = err.message;
+  }
+};
+
+// Near-duplicate groups, with the suggested keeper, per-photo Delete
+// (to the OS Trash, never permanent), and per-group "Delete the rest".
+async function renderGroupsView() {
   const data = await api("/api/groups");
+  const view = $("groups-view");
+  if (!data.groups.length) {
+    view.innerHTML = "<p>No near-duplicate groups in this set.</p>";
+    return;
+  }
+  view.innerHTML = data.groups.map((grp, gi) => {
+    const keeper = grp.find((m) => m.is_suggested_keeper);
+    return `<div class="group"><h3>Group ${gi + 1} — ${grp.length} similar frames${keeper ? ` · suggested keeper: ${escHtml(keeper.filename)}` : ""}</h3><div class="compare">` +
+      grp.map((m) => `<figure><img src="/api/thumb/${m.id}"><figcaption>${escHtml(m.filename)} · score ${m.score.toFixed(2)}` +
+      (m.is_suggested_keeper ? ` <span class="label-badge winner">★ suggested keeper</span>` : "") + `</figcaption>` +
+      `<button onclick="labelId('${m.id}','keep')">Keep</button><button onclick="labelId('${m.id}','reject')">Reject</button><button onclick="showGroup(${gi})">Compare full</button>` +
+      `<button class="danger" data-delete-photo="${m.id}" data-filename="${escHtml(m.filename)}">Delete</button><span class="del-confirm" data-del-confirm="${m.id}"></span></figure>`).join("") +
+      `</div>` +
+      (grp.length > 1 && keeper ? `<button class="danger" data-delete-rest="${gi}" data-keep-id="${keeper.id}">Delete the rest (keep ${escHtml(keeper.filename)})</button><span class="del-confirm" data-del-rest-confirm="${gi}"></span>` : "") +
+      `</div>`;
+  }).join("");
+  view.querySelectorAll("[data-delete-photo]").forEach((b) => {
+    b.onclick = () => {
+      const id = b.getAttribute("data-delete-photo");
+      const fn = b.getAttribute("data-filename");
+      const slot = view.querySelector(`[data-del-confirm="${id}"]`);
+      slot.innerHTML = `Move <b>${escHtml(fn)}</b> to Trash? <button data-del-yes="${id}">Yes, delete</button> <button data-del-no="${id}">Cancel</button>`;
+      slot.querySelector("[data-del-yes]").onclick = async () => {
+        slot.textContent = "Deleting…";
+        try {
+          await api("/api/dupes/delete", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id }) });
+          await refresh();
+          await renderGroupsView();
+        } catch (err) { slot.textContent = "Delete failed: " + err.message; }
+      };
+      slot.querySelector("[data-del-no]").onclick = () => { slot.innerHTML = ""; };
+    };
+  });
+  view.querySelectorAll("[data-delete-rest]").forEach((b) => {
+    b.onclick = () => {
+      const gi = parseInt(b.getAttribute("data-delete-rest"), 10);
+      const keepId = b.getAttribute("data-keep-id");
+      const grp = data.groups[gi];
+      const rest = grp.filter((m) => m.id !== keepId);
+      const keeper = grp.find((m) => m.id === keepId);
+      const slot = view.querySelector(`[data-del-rest-confirm="${gi}"]`);
+      slot.innerHTML = `<b>Delete ${rest.length} photo(s) to Trash, keeping ${escHtml(keeper.filename)}?</b><br>` +
+        rest.map((m) => escHtml(m.filename)).join(", ") +
+        ` <button data-del-rest-yes="${gi}">Yes, delete the rest</button> <button data-del-rest-no="${gi}">Cancel</button>`;
+      slot.querySelector("[data-del-rest-yes]").onclick = async () => {
+        slot.textContent = "Deleting…";
+        try {
+          await api("/api/dupes/delete-group", { method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ group_id: gi, keep_id: keepId, confirmed: true }) });
+          await refresh();
+          await renderGroupsView();
+        } catch (err) { slot.textContent = "Delete failed: " + err.message; }
+      };
+      slot.querySelector("[data-del-rest-no]").onclick = () => { slot.innerHTML = ""; };
+    };
+  });
+}
+
+$("btn-groups").onclick = async () => {
   const view = $("groups-view");
   groupsVisible = !groupsVisible;
   view.hidden = !groupsVisible;
-  if (groupsVisible) {
-    view.innerHTML = data.groups.map((grp, gi) => `<div class="group"><h3>Group ${gi + 1}</h3><div class="compare">` +
-      grp.map((m) => `<figure><img src="/api/thumb/${m.id}"><figcaption>${m.filename} · score ${m.score.toFixed(2)}</figcaption>` +
-      `<button onclick="labelId('${m.id}','keep')">Keep</button><button onclick="labelId('${m.id}','reject')">Reject</button><button onclick="showGroup(${gi})">Compare full</button></figure>`).join("") +
-      `</div></div>`).join("");
-  }
+  if (groupsVisible) await renderGroupsView();
 };
 $("btn-export").onclick = async () => {
   const res = await api("/api/export", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });

@@ -30,11 +30,12 @@ from pydantic import BaseModel
 import features
 from pairwise import PairwisePass, blend
 from pairwise_learn import PAIRWISE_LEARNED_EVAL, fit_pairwise_weights
+from people import PeoplePass
 from taste_model import TasteModel, feature_vector
 from vision import SAM_PROMPT, SAM_SCORE_HELPER, VisionPass
 
 APP_DIR = Path(__file__).resolve().parent
-DEMO_DIR = APP_DIR.parent / "files" / "taste-photo-set"
+DEFAULT_DEMO_DIR = APP_DIR.parent / "files" / "taste-photo-set"
 DATA_DIR = APP_DIR / "data"
 UPLOAD_DIR = DATA_DIR / "uploads"
 EXPORT_DIR = DATA_DIR / "exports"
@@ -42,12 +43,55 @@ CACHE_DIR = APP_DIR / ".cache"
 THUMB_DIR = CACHE_DIR / "thumbs"
 FEATURE_CACHE_FILE = CACHE_DIR / "features.json"
 LABELS_FILE = DATA_DIR / "labels.json"
+# The working-set folder chosen via POST /api/source/set, persisted so
+# it survives restarts. This supersedes the old TASTE_DEMO_DIR env
+# patch (v2 Mac setup): the folder is now chosen in the app, not in
+# run.sh, and the file below is the only place it is remembered.
+WORKING_DIR_FILE = DATA_DIR / "working-dir.json"
+# Photos deleted to the OS Trash, keyed by SOURCE PATH (not content
+# sha): byte-identical duplicates share a sha, so sha-keying would
+# hide a photo's twin when only one copy was deleted. A path key
+# deletes exactly the file the user pointed at.
+DELETED_FILE = DATA_DIR / "deleted.json"
 
 for d in (DATA_DIR, UPLOAD_DIR, EXPORT_DIR, CACHE_DIR, THUMB_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
+
+def _load_persisted_demo_dir() -> Path:
+    """Working-set folder from data/working-dir.json, if it still
+    exists with a manifest.csv; otherwise the built-in demo set."""
+    try:
+        data = json.loads(WORKING_DIR_FILE.read_text())
+        p = Path(data["demo_dir"]).expanduser()
+        if p.is_dir() and (p / "manifest.csv").is_file():
+            return p
+    except (OSError, ValueError, KeyError, AttributeError):
+        pass
+    return DEFAULT_DEMO_DIR
+
+
+# Mutable: POST /api/source/set reassigns this (and persists it).
+DEMO_DIR = _load_persisted_demo_dir()
+
+
+def load_deleted_paths() -> set[str]:
+    if DELETED_FILE.exists():
+        try:
+            data = json.loads(DELETED_FILE.read_text())
+            if isinstance(data, list):
+                return {str(s) for s in data}
+        except (json.JSONDecodeError, OSError):
+            return set()
+    return set()
+
+
+def save_deleted_paths(paths: set[str]) -> None:
+    DELETED_FILE.write_text(json.dumps(sorted(paths), indent=1))
+
 app = FastAPI(title="Taste — AI photo culling that learns your eye")
 vision_pass = VisionPass(CACHE_DIR / "vision")
+people_pass = PeoplePass(CACHE_DIR / "people", APP_DIR / "efficientdet_lite0.tflite")
 pairwise_pass = PairwisePass(CACHE_DIR / "pairwise")
 model = TasteModel()
 # Pairwise-learned (Bradley-Terry) weights, computed on each refit for
@@ -58,10 +102,16 @@ pairwise_learned_weights: dict | None = None
 
 # ---------------------------------------------------------------- state
 class Item:
-    def __init__(self, source: Path, set_name: str, calib_label: str | None):
+    def __init__(self, source: Path, set_name: str, calib_label: str | None,
+                 manifest_source: str = ""):
         self.source = source
         self.set_name = set_name
         self.calib_label = calib_label  # "keeper" | "reject" | None
+        self.manifest_source = manifest_source  # manifest `source` col:
+        # absolute path of the original file this working-set file came
+        # from (a RAW for extracted previews, the JPEG itself for
+        # linked originals). Used by the delete path to check a
+        # symlink target is really this photo's original.
         self.user_label: str | None = None  # "keep" | "reject" | None
         self.sha = ""
         self.feat: dict = {}
@@ -119,7 +169,7 @@ def save_persisted_labels(labels: dict) -> None:
 
 
 def load_demo_set() -> WorkingSet:
-    """Build the demo working set from the manifest. Read-only: no copies."""
+    """Build the working set from DEMO_DIR/manifest.csv. Read-only: no copies."""
     manifest = DEMO_DIR / "manifest.csv"
     try:
         manifest_file = open(manifest, newline="")
@@ -135,8 +185,12 @@ def load_demo_set() -> WorkingSet:
             if not src.exists():
                 continue
             label = row["label"] if row["label"] in ("keeper", "reject") else None
-            items.append(Item(src, row["set"], label))
-    ws = WorkingSet("demo — your Nepal frames (152)", items)
+            items.append(Item(src, row["set"], label, row.get("source", "") or ""))
+    if DEMO_DIR.resolve() == DEFAULT_DEMO_DIR.resolve():
+        name = "demo — your Nepal frames (152)"
+    else:
+        name = f"{DEMO_DIR.name} ({len(items)} frames)"
+    ws = WorkingSet(name, items)
     _apply_persisted_labels(ws)
     return ws
 
@@ -158,11 +212,19 @@ def ensure_ranked() -> list[dict]:
         return working.ranked
 
     feat_cache = load_feature_cache()
+    deleted = load_deleted_paths()
     train_vecs, train_labels = [], []
     ranked = []
     for idx, it in enumerate(working.items):
         if not it.sha:
             it.sha = features.file_sha256(it.source)
+        if str(it.source) in deleted:
+            # Trashed via /api/dupes/delete: excluded from the ranking,
+            # the groups, the people lists and the dry-runs. The item
+            # stays in working.items so ids stay stable within a set.
+            # Keyed by source path, not sha: byte-identical duplicates
+            # share a sha, and deleting one must not hide its twin.
+            continue
         if it.sha in feat_cache:
             it.feat = feat_cache[it.sha]
         else:
@@ -309,6 +371,196 @@ def invalidate() -> None:
         working.ranked = None
 
 
+def _people_items() -> list[tuple[str, Path, str]]:
+    """Current working set as (id, source, sha) for the people pass.
+
+    Deleted (trashed) photos are excluded here, so they never appear
+    in /api/people, the detection job, or the separate dry-runs."""
+    assert working is not None
+    deleted = load_deleted_paths()
+    out = []
+    for idx, it in enumerate(working.items):
+        if not it.sha:
+            it.sha = features.file_sha256(it.source)
+        if str(it.source) in deleted:
+            continue
+        out.append((str(idx), it.source, it.sha))
+    return out
+
+
+# ------------------------------------------------- separate into folders
+RAW_EXTS = [".RW2", ".ARW", ".DNG", ".NEF", ".CR2", ".CR3", ".RAF", ".ORF"]
+RAW_EXT_SET = {e.lower() for e in RAW_EXTS}
+
+
+class SeparateError(Exception):
+    """The separate plan cannot be built; carries the message, an HTTP
+    status, and any extra fields for the API response."""
+
+    def __init__(self, message: str, status: int = 400, extra: dict | None = None):
+        super().__init__(message)
+        self.message = message
+        self.status = status
+        self.extra = extra or {}
+
+
+def _read_raw_dir() -> Path:
+    """RAW folder from DEMO_DIR/source.json {"raw_dir": "..."}.
+
+    Written by the preview-extraction step. Never guess a path: a
+    missing file, a bad file, or a non-existent folder is an error
+    telling the user the RAW folder is unknown.
+    """
+    src_file = DEMO_DIR / "source.json"
+    if not src_file.exists():
+        raise SeparateError(
+            "RAW folder unknown — no source.json in the working-set folder. "
+            "Run the preview-extraction step first so it can record the RAW folder."
+        )
+    try:
+        data = json.loads(src_file.read_text())
+    except (json.JSONDecodeError, OSError) as exc:
+        raise SeparateError(
+            f"Cannot read source.json in the working-set folder: {exc}"
+        )
+    raw_dir = data.get("raw_dir") if isinstance(data, dict) else None
+    if not raw_dir or not isinstance(raw_dir, str):
+        raise SeparateError(
+            "source.json in the working-set folder has no usable raw_dir — "
+            "run the preview-extraction step first."
+        )
+    p = Path(raw_dir).expanduser()
+    if not p.is_dir():
+        raise SeparateError(f"RAW folder does not exist: {raw_dir}")
+    return p
+
+
+def _index_raw_dir(raw_dir: Path) -> dict[str, list[Path]]:
+    """RAW files in raw_dir keyed by filename stem (lowercased).
+
+    Flat scan only — the RAW folder is one folder of originals.
+    Within a stem, files sort by the RAW_EXTS order above, then name,
+    so the match is deterministic when several extensions share a stem.
+    """
+    ext_order = {e.lower(): i for i, e in enumerate(RAW_EXTS)}
+    index: dict[str, list[Path]] = {}
+    for p in raw_dir.iterdir():
+        if not p.is_file():
+            continue
+        if p.suffix.lower() not in RAW_EXT_SET:
+            continue
+        index.setdefault(p.stem.lower(), []).append(p)
+    for paths in index.values():
+        paths.sort(key=lambda p: (ext_order.get(p.suffix.lower(), 99), p.name))
+    return index
+
+
+def _separate_plan(require_complete: bool = True) -> dict:
+    """Match every working-set item with a detection result to its RAW original.
+
+    with_people / without_people are lists of {id, preview, raw_src,
+    has_person}; unmatched / no_result are preview filenames. With
+    require_complete=True (dry-run), any item without a detection
+    result raises SeparateError carrying the no-result list; with
+    False (run), those items are reported as skipped instead.
+    """
+    global working
+    if working is None:
+        working = load_demo_set()
+    raw_dir = _read_raw_dir()
+    index = _index_raw_dir(raw_dir)
+    parent = raw_dir.parent
+    plan = {
+        "raw_dir": str(raw_dir),
+        "dest_with": str(parent / "with-people"),
+        "dest_without": str(parent / "without-people"),
+        "with_people": [],
+        "without_people": [],
+        "unmatched": [],
+        "no_result": [],
+    }
+    for item_id, src, sha in _people_items():
+        hit = people_pass.cached(sha)
+        if hit is None:
+            plan["no_result"].append(src.name)
+            continue
+        raws = index.get(src.stem.lower())
+        if not raws:
+            plan["unmatched"].append(src.name)
+            continue
+        entry = {
+            "id": item_id,
+            "preview": src.name,
+            "raw_src": str(raws[0]),
+            "has_person": bool(hit["has_person"]),
+        }
+        (plan["with_people"] if entry["has_person"] else plan["without_people"]).append(entry)
+    if require_complete and plan["no_result"]:
+        raise SeparateError(
+            "People detection is not complete — "
+            f"{len(plan['no_result'])} photo(s) have no result yet. "
+            "Run Detect people first.",
+            status=400,
+            extra={"no_result": plan["no_result"]},
+        )
+    return plan
+
+
+def _dedup_dest_name(dest_dir: Path, name: str, used: set[str]) -> str:
+    """Dest filename that never overwrites: the same _2/_3 rule as
+    /api/export, plus a check against files already in the folder
+    (export's dirs are always fresh; separate's dest folders may
+    already hold files from an earlier run)."""
+    stem = Path(name).stem
+    suffix = Path(name).suffix
+    candidate = name
+    n = 2
+    while candidate in used or (dest_dir / candidate).exists():
+        candidate = f"{stem}_{n}{suffix}"
+        n += 1
+    used.add(candidate)
+    return candidate
+
+
+def _move_raw_files(entries: list[dict], dest_for) -> tuple[list[dict], list[str]]:
+    """Move matched RAW files; shared by people-separate and best-shots.
+
+    entries: [{preview, raw_src, ...}] where raw_src is the current
+    location. dest_for(entry) -> destination directory Path. Dedupes
+    dest names with _2/_3 (also against files already in the folder).
+    A RAW that is already gone (same stem matched by two previews —
+    the first move took it) is reported as skipped_missing, not an
+    error. Nothing is deleted. Returns (moves, skipped_missing);
+    each move is its entry plus raw_dest.
+    """
+    moves: list[dict] = []
+    skipped_missing: list[str] = []
+    used: dict[Path, set[str]] = {}
+    for entry in entries:
+        dest_dir = dest_for(entry)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        used.setdefault(dest_dir, set())
+        src = Path(entry["raw_src"])
+        if not src.exists():
+            skipped_missing.append(entry["preview"])
+            continue
+        dest_name = _dedup_dest_name(dest_dir, src.name, used[dest_dir])
+        dest = dest_dir / dest_name
+        shutil.move(str(src), str(dest))
+        moves.append({**entry, "raw_dest": str(dest)})
+    return moves, skipped_missing
+
+
+def _write_move_log(log: dict, log_filename: str, copy_dirs: list[Path],
+                    copy_name: str) -> Path:
+    """Write a move log to data/ plus a copy in each dest folder."""
+    log_path = DATA_DIR / log_filename
+    log_path.write_text(json.dumps(log, indent=1))
+    for dest_dir in copy_dirs:
+        (dest_dir / copy_name).write_text(json.dumps(log, indent=1))
+    return log_path
+
+
 # ---------------------------------------------------------------- API
 class LabelBody(BaseModel):
     id: str
@@ -349,6 +601,7 @@ def state():
         },
         "dupe_groups": len(working.groups),
         "dupe_frames": sum(len(g) for g in working.groups),
+        "people": people_pass.status_for(_people_items()),
         "pairwise_groups_total": len(working.groups),
         "pairwise_groups_live": len(
             {r["group"] for r in ranked if r["pairwise"]["status"] == "live"}
@@ -364,10 +617,660 @@ def rank():
     return {"items": ensure_ranked()}
 
 
+@app.post("/api/people/start")
+def people_start():
+    """Start background people detection over the current working set.
+
+    Returns immediately with the job status; the run proceeds in a
+    worker thread (~0.6 s/photo on CPU) and never blocks the UI.
+    Poll GET /api/people for progress. Fully offline — no API key.
+    """
+    global working
+    if working is None:
+        working = load_demo_set()
+    return people_pass.start(_people_items())
+
+
+@app.get("/api/people")
+def people():
+    """People flags for the current working set + job status.
+
+    Undetected photos report has_person null (never a guessed value);
+    the job status says whether a run is idle, running, done, or
+    unavailable (e.g. mediapipe/model missing).
+    """
+    global working
+    if working is None:
+        working = load_demo_set()
+    items = _people_items()
+    status = people_pass.status_for(items)
+    out = []
+    for item_id, _src, sha in items:
+        hit = people_pass.cached(sha)
+        it = working.items[int(item_id)]
+        out.append(
+            {
+                "id": item_id,
+                "filename": it.filename,
+                "has_person": hit["has_person"] if hit else None,
+                "person_count": hit["person_count"] if hit else None,
+                "max_conf": hit["max_conf"] if hit else None,
+                "detected": hit is not None,
+            }
+        )
+    return {**status, "items": out}
+
+
+class PeopleOverrideBody(BaseModel):
+    id: str
+    has_person: bool
+
+
+@app.post("/api/people/override")
+def people_override(body: PeopleOverrideBody):
+    """Flip one photo's people result (manual correction).
+
+    Updates the disk cache, so GET /api/people, the filter counts,
+    and the separate dry-run reflect the change immediately.
+    """
+    global working
+    if working is None:
+        working = load_demo_set()
+    it = working.by_id(body.id)
+    if it is None:
+        return JSONResponse({"error": "unknown id"}, status_code=404)
+    if not it.sha:
+        it.sha = features.file_sha256(it.source)
+    data = people_pass.override(it.sha, body.has_person)
+    return {
+        "ok": True,
+        "id": body.id,
+        "filename": it.filename,
+        "has_person": data["has_person"],
+        "person_count": data["person_count"],
+        "max_conf": data["max_conf"],
+    }
+
+
+@app.get("/api/people/separate/dry-run")
+def people_separate_dry_run():
+    """What the separate run would move. Moves nothing.
+
+    Requires detection done for every item; otherwise 400 with the
+    no-result list. with_people / without_people are preview filenames
+    (the RAW originals are what would move).
+    """
+    global working
+    if working is None:
+        working = load_demo_set()
+    try:
+        plan = _separate_plan(require_complete=True)
+    except SeparateError as exc:
+        return JSONResponse({"error": exc.message, **exc.extra}, status_code=exc.status)
+    return {
+        "with_people": [e["preview"] for e in plan["with_people"]],
+        "without_people": [e["preview"] for e in plan["without_people"]],
+        "unmatched": plan["unmatched"],
+        "no_result": plan["no_result"],
+        "dest_with": plan["dest_with"],
+        "dest_without": plan["dest_without"],
+        "counts": {
+            "with_people": len(plan["with_people"]),
+            "without_people": len(plan["without_people"]),
+            "unmatched": len(plan["unmatched"]),
+            "no_result": len(plan["no_result"]),
+        },
+    }
+
+
+class SeparateRunBody(BaseModel):
+    confirmed: bool = False
+
+
+@app.post("/api/people/separate/run")
+def people_separate_run(body: SeparateRunBody):
+    """Move matched RAW originals into with-people / without-people
+    folders next to the RAW folder. Only the RAWs move — previews
+    stay where they are. Refuses without {"confirmed": true}.
+    Items with no result or no matching RAW are skipped and reported.
+    Nothing is deleted; every move is written to a log in data/ and
+    a copy in each destination folder.
+    """
+    if not body.confirmed:
+        return JSONResponse(
+            {
+                "error": "refusing to move files — review the dry-run first, "
+                'then call with {"confirmed": true}'
+            },
+            status_code=400,
+        )
+    global working
+    if working is None:
+        working = load_demo_set()
+    try:
+        plan = _separate_plan(require_complete=False)
+    except SeparateError as exc:
+        return JSONResponse({"error": exc.message, **exc.extra}, status_code=exc.status)
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    dest_with = Path(plan["dest_with"])
+    dest_without = Path(plan["dest_without"])
+    entries = plan["with_people"] + plan["without_people"]
+    raw_moves, skipped_missing = _move_raw_files(
+        entries, lambda e: dest_with if e["has_person"] else dest_without
+    )
+    moves = [
+        {
+            "preview": m["preview"],
+            "raw_src": m["raw_src"],
+            "raw_dest": m["raw_dest"],
+            "has_person": m["has_person"],
+        }
+        for m in raw_moves
+    ]
+    log = {
+        "timestamp": ts,
+        "raw_dir": plan["raw_dir"],
+        "dest_with": plan["dest_with"],
+        "dest_without": plan["dest_without"],
+        "moves": moves,
+        "skipped_no_result": plan["no_result"],
+        "skipped_unmatched": plan["unmatched"],
+        "skipped_missing": skipped_missing,
+        "counts": {
+            "moved_with": sum(1 for m in moves if m["has_person"]),
+            "moved_without": sum(1 for m in moves if not m["has_person"]),
+            "skipped_no_result": len(plan["no_result"]),
+            "skipped_unmatched": len(plan["unmatched"]),
+            "skipped_missing": len(skipped_missing),
+        },
+    }
+    log_path = _write_move_log(
+        log, f"separate-log-{ts}.json",
+        [dest_with, dest_without], f"_move-log-{ts}.json",
+    )
+    return {
+        "ok": True,
+        "moved_with": log["counts"]["moved_with"],
+        "moved_without": log["counts"]["moved_without"],
+        "skipped_no_result": plan["no_result"],
+        "skipped_unmatched": plan["unmatched"],
+        "skipped_missing": skipped_missing,
+        "dest_with": plan["dest_with"],
+        "dest_without": plan["dest_without"],
+        "log": str(log_path),
+        "moves": moves,
+    }
+
+
+# ---------------------------------------------------------------- best shots
+BEST_TOP_N = (10, 25, 50, 100)
+
+
+def _best_picks(top_n: int) -> tuple[list[dict], list[dict]]:
+    """One best shot per similar-group, in global rank order.
+
+    Walks ensure_ranked() top-down (same ranking as /api/rank); the
+    first photo of each dHash dupe group is a pick, the rest of that
+    group are skipped dupes. Ungrouped photos pass through. The user
+    filters/rejects picks in the UI before any move. Returns
+    (picks, skipped_dupes); each pick carries score, sharpness,
+    exposure_quality and group_size ("best of N similar").
+    """
+    ranked = ensure_ranked()
+    assert working is not None
+    group_size = {}
+    for grp in working.groups:
+        for m in grp:
+            group_size[m] = len(grp)
+    picks, skipped = [], []
+    seen_groups: set[int] = set()
+    for r in ranked:
+        g = r["group"]
+        if g is not None:
+            if g in seen_groups:
+                skipped.append(
+                    {
+                        "id": r["id"],
+                        "filename": r["filename"],
+                        "group_size": group_size.get(r["id"], 1),
+                    }
+                )
+                continue
+            seen_groups.add(g)
+        picks.append(
+            {
+                "id": r["id"],
+                "filename": r["filename"],
+                "score": r["score"],
+                "sharpness": r["sharpness"],
+                "exposure_quality": r["exposure_quality"],
+                "group_size": group_size.get(r["id"], 1),
+            }
+        )
+        if len(picks) >= top_n:
+            break
+    return picks, skipped
+
+
+def _best_dest() -> tuple[Path, Path]:
+    """(raw_dir, best-shots dest) — same raw_dir source as the people
+    separation; the same clear error when the RAW folder is unknown."""
+    raw_dir = _read_raw_dir()
+    return raw_dir, raw_dir.parent / "best-shots"
+
+
+@app.get("/api/best/dry-run")
+def best_dry_run(top_n: int = 10):
+    """What the best-shots run would move. Moves nothing.
+
+    Picks are one best per dupe group (see _best_picks). `unmatched`
+    lists picks with no RAW original to move — those are reported,
+    never guessed at.
+    """
+    if top_n not in BEST_TOP_N:
+        return JSONResponse(
+            {"error": f"top_n must be one of {list(BEST_TOP_N)}"},
+            status_code=400,
+        )
+    try:
+        raw_dir, dest_dir = _best_dest()
+    except SeparateError as exc:
+        return JSONResponse({"error": exc.message, **exc.extra}, status_code=exc.status)
+    picks, skipped = _best_picks(top_n)
+    index = _index_raw_dir(raw_dir)
+    unmatched = [
+        p["filename"]
+        for p in picks
+        if Path(p["filename"]).stem.lower() not in index
+    ]
+    return {
+        "picks": picks,
+        "skipped_dupes": skipped,
+        "unmatched": unmatched,
+        "dest": str(dest_dir),
+        "top_n": top_n,
+    }
+
+
+class BestRunBody(BaseModel):
+    confirmed: bool = False
+    top_n: int = 10
+    excluded: list[str] | None = None
+
+
+@app.post("/api/best/separate/run")
+def best_separate_run(body: BestRunBody):
+    """Move the best-shots picks' RAW originals into a best-shots
+    folder next to the RAW folder. Picks are recomputed server-side
+    (same rule as the dry-run); `excluded` ids — the picks the user
+    rejected in the UI — are dropped before matching. Only the RAWs
+    move; nothing is deleted. Refuses without {"confirmed": true}.
+    """
+    if not body.confirmed:
+        return JSONResponse(
+            {
+                "error": "refusing to move files — review the dry-run first, "
+                'then call with {"confirmed": true}'
+            },
+            status_code=400,
+        )
+    if body.top_n not in BEST_TOP_N:
+        return JSONResponse(
+            {"error": f"top_n must be one of {list(BEST_TOP_N)}"},
+            status_code=400,
+        )
+    excluded = set(body.excluded or [])
+    try:
+        raw_dir, dest_dir = _best_dest()
+    except SeparateError as exc:
+        return JSONResponse({"error": exc.message, **exc.extra}, status_code=exc.status)
+    picks, skipped = _best_picks(body.top_n)
+    index = _index_raw_dir(raw_dir)
+    entries, unmatched = [], []
+    for p in picks:
+        if p["id"] in excluded:
+            continue
+        raws = index.get(Path(p["filename"]).stem.lower())
+        if not raws:
+            unmatched.append(p["filename"])
+            continue
+        entries.append(
+            {
+                "id": p["id"],
+                "preview": p["filename"],
+                "raw_src": str(raws[0]),
+                "score": p["score"],
+            }
+        )
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    raw_moves, skipped_missing = _move_raw_files(entries, lambda e: dest_dir)
+    moves = [
+        {
+            "id": m["id"],
+            "preview": m["preview"],
+            "raw_src": m["raw_src"],
+            "raw_dest": m["raw_dest"],
+            "score": m["score"],
+        }
+        for m in raw_moves
+    ]
+    log = {
+        "timestamp": ts,
+        "raw_dir": str(raw_dir),
+        "dest": str(dest_dir),
+        "top_n": body.top_n,
+        "moves": moves,
+        "excluded": sorted(excluded),
+        "skipped_dupes": skipped,
+        "skipped_unmatched": unmatched,
+        "skipped_missing": skipped_missing,
+        "counts": {
+            "moved": len(moves),
+            "excluded": len(excluded),
+            "skipped_dupes": len(skipped),
+            "skipped_unmatched": len(unmatched),
+            "skipped_missing": len(skipped_missing),
+        },
+    }
+    log_path = _write_move_log(
+        log, f"best-shots-log-{ts}.json",
+        [dest_dir], f"_best-shots-log-{ts}.json",
+    )
+    return {
+        "ok": True,
+        "moved": len(moves),
+        "excluded": sorted(excluded),
+        "skipped_unmatched": unmatched,
+        "skipped_missing": skipped_missing,
+        "dest": str(dest_dir),
+        "log": str(log_path),
+        "moves": moves,
+    }
+
+
+# ---------------------------------------------------------------- source (feed any folder)
+class SourceSetBody(BaseModel):
+    demo_dir: str
+
+
+@app.get("/api/source")
+def source_get():
+    """Current working-set folder, without triggering a rank.
+
+    total = manifest items; visible = items still shown (deleted
+    photos excluded)."""
+    global working
+    if working is None:
+        working = load_demo_set()
+    return {
+        "demo_dir": str(DEMO_DIR),
+        "set_name": working.name,
+        "total": len(working.items),
+        "visible": len(ensure_ranked()),
+        "manifest": (DEMO_DIR / "manifest.csv").is_file(),
+        "persisted": WORKING_DIR_FILE.exists(),
+    }
+
+
+@app.post("/api/source/set")
+def source_set(body: SourceSetBody):
+    """Switch the working set to an already-ingested folder (see
+    tools/ingest.py). The folder must contain manifest.csv, else 400
+    with a clear message. No restart: the in-memory rank is cleared,
+    the manifest is re-read, and people-detection state resets for
+    the new set. The choice is persisted to data/working-dir.json so
+    it survives restarts."""
+    global DEMO_DIR, working
+    p = Path(body.demo_dir).expanduser()
+    if not p.is_dir():
+        return JSONResponse(
+            {"error": f"folder does not exist: {body.demo_dir}"}, status_code=400
+        )
+    if not (p / "manifest.csv").is_file():
+        return JSONResponse(
+            {
+                "error": f"no manifest.csv in {body.demo_dir} — run "
+                "tools/ingest.py on a photo folder first"
+            },
+            status_code=400,
+        )
+    DEMO_DIR = p
+    WORKING_DIR_FILE.write_text(json.dumps({"demo_dir": str(p)}, indent=1))
+    working = load_demo_set()
+    people_pass.reset()
+    return {
+        "demo_dir": str(DEMO_DIR),
+        "set_name": working.name,
+        "total": len(working.items),
+        "persisted": True,
+    }
+
+
+# ---------------------------------------------------------------- similar cleanup (delete to Trash)
+def _trash_dir() -> Path:
+    """OS Trash folder: macOS ~/.Trash, Linux ~/.local/share/Trash/files."""
+    if sys.platform == "darwin":
+        return Path.home() / ".Trash"
+    base = Path.home() / ".local" / "share" / "Trash"
+    (base / "files").mkdir(parents=True, exist_ok=True)
+    (base / "info").mkdir(parents=True, exist_ok=True)
+    return base / "files"
+
+
+def _move_to_trash(src: Path) -> Path:
+    """Move a file to the OS Trash — never a permanent delete.
+
+    Dest names are deduped (_2/_3). On Linux a .trashinfo file is
+    written alongside so file managers can restore it.
+    """
+    trash = _trash_dir()
+    trash.mkdir(parents=True, exist_ok=True)
+    dest_name = _dedup_dest_name(trash, src.name, set())
+    dest = trash / dest_name
+    shutil.move(str(src), str(dest))
+    if sys.platform != "darwin":
+        info_dir = trash.parent / "info"
+        info_dir.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S")
+        (info_dir / f"{dest_name}.trashinfo").write_text(
+            f"[Trash Info]\nPath={src}\nDeletionDate={stamp}\n"
+        )
+    return dest
+
+
+def _delete_source_for(it: Item) -> tuple[Path, Path | None]:
+    """The file to trash for one photo, plus a symlink to unlink after
+    (or None).
+
+    - Matched RAW in raw_dir? Trash the RAW; the preview stays.
+    - Else the photo file itself. If it is a symlink, trash its
+      TARGET — but only when the target is this photo's recorded
+      original (the manifest `source` column), and unlink the link
+      itself afterwards. A symlink whose target is not the recorded
+      original is refused: trashing it could delete the wrong file.
+    - A regular file must live inside the working set or the RAW
+      folder, else it is refused (delete it by hand).
+    A preview file is never trashed on its own while its RAW exists.
+    """
+    raw_dir: Path | None = None
+    try:
+        raw_dir = _read_raw_dir()
+        index = _index_raw_dir(raw_dir)
+        raws = index.get(it.source.stem.lower())
+        if raws:
+            return raws[0], None
+    except SeparateError:
+        raw_dir = None
+    src = it.source
+    if src.is_symlink():
+        target = src.resolve()
+        recorded = Path(it.manifest_source).expanduser() if it.manifest_source else None
+        if recorded is not None and target == recorded.resolve():
+            return target, src
+        raise SeparateError(
+            f"cannot delete {src.name}: its link target is not the "
+            "recorded original — delete it by hand"
+        )
+    resolved = src.resolve()
+    allowed = [DEMO_DIR.resolve()]
+    if raw_dir is not None:
+        allowed.append(raw_dir.resolve())
+    if not any(resolved == a or a in resolved.parents for a in allowed):
+        raise SeparateError(
+            f"cannot delete {src.name}: it lives outside the working "
+            "set — delete it by hand"
+        )
+    return src, None
+
+
+def _append_delete_log(entries: list[dict]) -> Path:
+    """One delete-log file per delete operation, in data/."""
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    log_path = DATA_DIR / f"delete-log-{ts}.json"
+    log_path.write_text(
+        json.dumps({"timestamp": ts, "entries": entries}, indent=1)
+    )
+    return log_path
+
+
+def _delete_one(item_id: str, it: Item, write_log: bool = True) -> dict:
+    """Trash one photo's source file and record the deletion.
+
+    The photo's source path is added to data/deleted.json, so it is excluded
+    from /api/rank, /api/groups, /api/people and the separation
+    dry-runs from then on. A source file that is already gone (its
+    RAW was moved by an earlier separation) is recorded with
+    trash_dest null and a note — the photo is still hidden, and
+    nothing crashes. `restored_from` is null: restore is a manual
+    move back from the OS Trash (the log names the exact trash
+    location); no automatic restore is built.
+    """
+    if not it.sha:
+        it.sha = features.file_sha256(it.source)
+    src, extra_unlink = _delete_source_for(it)
+    if src.exists() or src.is_symlink():
+        trash_dest = _move_to_trash(src)
+        note = ""
+    else:
+        trash_dest = None
+        note = "source file was already gone"
+    if extra_unlink is not None:
+        extra_unlink.unlink(missing_ok=True)
+    entry = {
+        "id": item_id,
+        "filename": it.filename,
+        "src": str(src),
+        "trash_dest": str(trash_dest) if trash_dest else None,
+        "restored_from": None,
+        "note": note,
+    }
+    if write_log:
+        _append_delete_log([entry])
+    deleted = load_deleted_paths()
+    deleted.add(str(it.source))
+    save_deleted_paths(deleted)
+    invalidate()
+    return entry
+
+
+class DeleteBody(BaseModel):
+    id: str
+
+
+@app.post("/api/dupes/delete")
+def dupes_delete(body: DeleteBody):
+    """Move one photo's source file to the OS Trash (never permanent
+    delete). The photo then disappears from the rank, groups, people
+    lists and dry-runs. The log entry names the exact trash location
+    for a manual restore."""
+    global working
+    if working is None:
+        working = load_demo_set()
+    it = working.by_id(body.id)
+    if it is None:
+        return JSONResponse({"error": "unknown id"}, status_code=404)
+    try:
+        entry = _delete_one(body.id, it)
+    except SeparateError as exc:
+        return JSONResponse({"error": exc.message}, status_code=exc.status)
+    return {"ok": True, **entry}
+
+
+class DeleteGroupBody(BaseModel):
+    group_id: int
+    keep_id: str
+    confirmed: bool = False
+
+
+@app.post("/api/dupes/delete-group")
+def dupes_delete_group(body: DeleteGroupBody):
+    """Delete every non-keeper member of one dupe group (same Trash +
+    log mechanism as a single delete, one log entry per file, one
+    log file for the operation). Requires {"confirmed": true} and a
+    keep_id that is a member of the group."""
+    if not body.confirmed:
+        return JSONResponse(
+            {
+                "error": "refusing to delete — review the group first, "
+                'then call with {"confirmed": true}'
+            },
+            status_code=400,
+        )
+    global working
+    if working is None:
+        working = load_demo_set()
+    groups = working.groups if working else []
+    if body.group_id < 0 or body.group_id >= len(groups):
+        return JSONResponse({"error": "unknown group"}, status_code=400)
+    members = groups[body.group_id]
+    if body.keep_id not in members:
+        return JSONResponse(
+            {"error": "keep_id is not a member of this group"}, status_code=400
+        )
+    entries = []
+    for mid in members:
+        if mid == body.keep_id:
+            continue
+        it = working.by_id(mid)
+        if it is None:
+            continue
+        try:
+            entries.append(_delete_one(mid, it, write_log=False))
+        except SeparateError as exc:
+            entries.append(
+                {"id": mid, "filename": it.filename, "error": exc.message}
+            )
+    # One log file for the whole operation.
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    log_path = DATA_DIR / f"delete-log-{ts}.json"
+    log_path.write_text(
+        json.dumps(
+            {
+                "timestamp": ts,
+                "group_id": body.group_id,
+                "kept": body.keep_id,
+                "entries": entries,
+            },
+            indent=1,
+        )
+    )
+    return {
+        "ok": True,
+        "kept": body.keep_id,
+        "deleted": entries,
+        "log": str(log_path),
+    }
+
+
 @app.post("/api/load-demo")
 def load_demo():
-    global working
+    """Back to the built-in demo set (also clears a persisted
+    source choice)."""
+    global DEMO_DIR, working
+    DEMO_DIR = DEFAULT_DEMO_DIR
+    WORKING_DIR_FILE.unlink(missing_ok=True)
     working = load_demo_set()
+    people_pass.reset()
     return {"set_name": working.name, "total": len(working.items)}
 
 
@@ -400,6 +1303,7 @@ async def upload(files: list[UploadFile] = File(...)):
     items = [Item(dest, "upload", None) for dest, _ in staged]
     working = WorkingSet(f"upload batch ({len(items)} frames)", items)
     _apply_persisted_labels(working)
+    people_pass.reset()
     return {"set_name": working.name, "total": len(items)}
 
 
@@ -427,7 +1331,13 @@ def groups():
     by_id = {r["id"]: r for r in ranked}
     out = []
     for grp in working.groups if working else []:
-        out.append([by_id[m] for m in grp if m in by_id])
+        members = [dict(by_id[m]) for m in grp if m in by_id]
+        if members:
+            # Suggested keeper: the highest-score member of the group.
+            keeper = max(members, key=lambda m: m["score"])
+            for m in members:
+                m["is_suggested_keeper"] = m["id"] == keeper["id"]
+        out.append(members)
     return {"groups": out}
 
 
